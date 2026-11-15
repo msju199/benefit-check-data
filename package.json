@@ -1,0 +1,11 @@
+{
+  "name": "benefit-check-pipeline",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "fetch": "node fetch.mjs --out ./out",
+    "links": "node check-links.mjs --out ./out --write",
+    "test": "node --test test/*.test.mjs"
+  }
+}
