@@ -1,0 +1,97 @@
+name: refresh-benefit-data
+
+# 매일 05:00 KST(= 20:00 UTC 전날)에 보조금24 공공서비스(혜택) 데이터를 받아 data 브랜치에 올려요.
+# 검증(건수·필드·크기)에 실패하면 올리지 않고, data 브랜치의 지난 데이터가 그대로 남아요.
+on:
+  schedule:
+    - cron: '0 20 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-benefit-data
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GOV24_SERVICE_KEY: ${{ secrets.GOV24_SERVICE_KEY }}
+    steps:
+      - name: 키 확인
+        id: key
+        run: |
+          if [ -z "$GOV24_SERVICE_KEY" ]; then
+            echo "::warning title=GOV24_SERVICE_KEY 없음::저장소 Settings > Secrets and variables > Actions에 GOV24_SERVICE_KEY를 넣어 주세요. 이번 실행은 데이터를 올리지 않고 끝내요."
+            echo "## 건너뜀: GOV24_SERVICE_KEY가 없어요" >> "$GITHUB_STEP_SUMMARY"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.key.outputs.present == 'true'
+
+      - uses: actions/setup-node@v4
+        if: steps.key.outputs.present == 'true'
+        with:
+          node-version: '22'
+
+      - name: 규칙 테스트
+        if: steps.key.outputs.present == 'true'
+        run: npm test
+
+      - name: 데이터 받기와 검증
+        if: steps.key.outputs.present == 'true'
+        # 실패(키 오류, 건수 불일치, 필드 없음, 첫 다운로드 1MB 초과)하면 여기서 멈춰요. 아래 게시 단계는 돌지 않아요.
+        run: node fetch.mjs --out ./out
+
+      - name: 링크 점검
+        if: steps.key.outputs.present == 'true'
+        # 링크 점검이 실패해도 데이터는 올려요. 결과는 상세 파일의 applyOk와 link-report.json에 남아요.
+        continue-on-error: true
+        run: node check-links.mjs --out ./out --write
+
+      - name: 결과 요약
+        if: steps.key.outputs.present == 'true'
+        run: |
+          node -e '
+            const r = require("./fetch-report.json");
+            const l = r.counts.loan;
+            const lines = [
+              "## 데이터 갱신",
+              `- 목록 ${r.counts.list}건, 개인 대상 ${r.counts.personal}건`,
+              `- 대출·융자·보증 제외: 지원유형 ${l.removedByType}건, 서비스명 ${l.removedByTitle}건, 섞인 유형 남김 ${l.mixedKept}건`,
+              `- 첫 다운로드 최대 ${r.worstFirstLoad}바이트(gzip), 한도 ${r.firstLoadLimit}`,
+              `- API 호출 ${r.apiCalls}회`,
+            ];
+            require("fs").appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join("\n") + "\n");
+          '
+
+      - name: 보고서 보관
+        if: always() && steps.key.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: |
+            fetch-report.json
+            link-report.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: data 브랜치에 올리기
+        if: steps.key.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          test -s out/meta.json
+          cd out
+          git init -q -b data
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "data $(date -u +%Y-%m-%dT%H:%MZ)"
+          # 이력은 남기지 않고 최신 한 벌만 둬요(저장소 크기 관리). 실패하면 지난 data 브랜치가 그대로 남아요.
+          git push -q --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" data:data
